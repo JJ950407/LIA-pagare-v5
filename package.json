@@ -5,6 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "preview": "node src/preview.js",
+    "start": "node bot.js",
     "dev": "node src/bot.js",
     "keep": "caffeinate -dims npm run dev",
     "deploy": "bash scripts/deploy.sh",
@@ -40,6 +41,7 @@
     "qrcode-reader": "^1.0.4",
     "qrcode-terminal": "^0.12.0",
     "sharp": "^0.33.5",
+    "@whiskeysockets/baileys": "^6.7.8",
     "whatsapp-web.js": "^1.33.1"
   },
   "devDependencies": {
