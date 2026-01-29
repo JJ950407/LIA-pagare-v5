@@ -4,6 +4,7 @@ const {
   fetchLatestBaileysVersion,
   useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 const MAX_DEDUP_SIZE = 10000;
@@ -94,7 +95,7 @@ async function initSocket({ onMessage, onReady }) {
 
   const newSocket = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     version
   });
 
@@ -104,7 +105,7 @@ async function initSocket({ onMessage, onReady }) {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       currentLogger.info('📲 ESCANEA ESTE QR CON WHATSAPP');
-      currentLogger.info(qr);
+      qrcode.generate(qr, { small: true });
     }
     if (connection === 'open') {
       currentLogger.info('✅ WhatsApp conectado correctamente');
