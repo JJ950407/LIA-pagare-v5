@@ -102,10 +102,11 @@ async function initSocket({ onMessage, onReady }) {
   newSocket.ev.on('creds.update', saveCreds);
 
   newSocket.ev.on('connection.update', (update) => {
+    currentLogger.info('DEBUG connection.update keys:', Object.keys(update));
     const { connection, lastDisconnect, qr } = update;
-    if (qr) {
+    if (update.qr) {
       currentLogger.info('📲 ESCANEA ESTE QR CON WHATSAPP');
-      qrcode.generate(qr, { small: true });
+      qrcode.generate(update.qr, { small: true });
     }
     if (connection === 'open') {
       currentLogger.info('✅ WhatsApp conectado correctamente');
