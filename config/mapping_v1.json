@@ -1,0 +1,31 @@
+{
+  "pdf": {
+    "base": "templates/base.pdf",
+    "qr": { "x_mm": 70, "y_mm": 8, "size_mm": 16 }
+  },
+  "fields": {
+    "monto en letra":      { "from": "pagare.monto", "type": "currencyWords" },
+    "monto":               { "from": "pagare.monto", "type": "currency" },
+
+    "no_folio ":           { "from": "pagare.folio", "pad": 2 },
+
+    "lugar expedicion":    { "from": "pagare.lugarExpedicion" },
+
+    "dia":                 { "from": "pagare.fechaEmision", "type": "day" },
+    "mes":                 { "from": "pagare.fechaEmision", "type": "monthName" },
+    "año":                 { "from": "pagare.fechaEmision", "type": "year" },
+
+    "beneficiario":        { "from": "beneficiario.nombre" },
+
+    "fecha de pago ":      { "from": "pagare.fechaVencimiento", "type": "dateDMY" },
+    "numero de pagares ":  { "from": "pagare.numeroDePagares" },
+    "moratorios":          { "from": "pagare.moratorios", "type": "percent" },
+
+    "nombre deudor":       { "from": "deudor.nombre" },
+    "direccion deudor":    { "from": "deudor.direccion" },
+
+    "poblacion deudor ":   { "from": "deudor.poblacion" },
+
+    "lugar de pago 1":     { "from": "pagare.lugarDePago" }
+  }
+}

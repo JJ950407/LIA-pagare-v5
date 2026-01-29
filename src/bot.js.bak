@@ -1,0 +1,1876 @@
+// === BOT PAGARÉ v3 – flujo + PDFs + meta.json + evidencias por QR ===
+const { Client, LocalAuth, MessageMedia, Buttons } = require('whatsapp-web.js');
+const qrt = require('qrcode-terminal');
+require('dotenv').config();
+
+const fs = require('fs');
+const crypto = require('crypto'); // requerido para pre/post hash
+const path = require('path');
+const { PDFDocument } = require('pdf-lib');
+const { renderToFile, renderToBuffer } = require('./pdf');
+// -----------------------------------------------------------------------------
+// Importa el mapeo seguro para contratos. Este módulo normaliza las entradas,
+// calcula cantidades en letra y fechas derivadas (día, día en letra, saldo, etc.),
+// y previene `undefined` en los campos. Se mantiene opcional la importación de
+// una función `numeroALetras` si existe en utils, de lo contrario buildMapping
+// utilizará sus propios valores por defecto.
+const buildMapping = require('../config/mapping.safe.js');
+let numeroALetras;
+try {
+  numeroALetras = require('../utils/numeroALetras');
+} catch (_) {
+  // Si no existe la función, dejamos undefined para que buildMapping maneje
+  numeroALetras = undefined;
+}
+// Import helpers for contrato
+const { decorateForContract } = require('./modules/contracts/decorate');
+const { generateContractDocxPdf } = require('./modules/contracts/generate');
+
+// QR decoder
+const Jimp = require('jimp');
+const QrCode = require('qrcode-reader');
+
+// === Helpers de HASH & AUDIT para pagarés ===
+async function sha256HexFromBuffer(buf) {
+  return require('crypto').createHash('sha256').update(buf).digest('hex');
+}
+async function sha256HexFromFile(filePath) {
+  const data = fs.readFileSync(filePath);
+  return sha256HexFromBuffer(data);
+}
+
+/**
+ * Escribe audit JSON atómico (.tmp → rename)
+ * tipo="PAGARE" compatible con contrato
+ */
+function writePagareAuditJson({
+  outDir, baseDocId, docId, clienteSlug, ventaId,
+  folio, deudor, monto, venceISO, venceDMY,
+  preHash, postHash, pdfPath
+}) {
+  fs.mkdirSync(outDir, { recursive: true });
+  const createdAt = new Date().toISOString();
+  const shortHash = preHash.slice(0, 10);
+
+  const auditObj = {
+    tipo: 'PAGARE',
+    baseDocId,
+    docId,
+    clienteSlug,
+    ventaId,
+    folio,
+    deudor,
+    monto,
+    venceISO,
+    venceDMY,
+    hash_sha256_pre_qr: preHash,
+    hash_corto_pre_qr: shortHash,
+    hash_sha256_post_qr: postHash,
+    qr_code: {}, // opcional
+    pdfPath,
+    createdAt
+  };
+
+  const safeBase = `${docId}_${createdAt.replace(/[:.]/g, '-')}`;
+  const finalPath = path.join(outDir, `audit_${safeBase}.json`);
+  const tmpPath   = finalPath + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify(auditObj, null, 2), 'utf8');
+  fs.renameSync(tmpPath, finalPath);
+  return { auditPath: finalPath, shortHash };
+}
+
+// --- Config ---
+const OUTPUT_ROOT = 'data/clientes';           // raíz por cliente/venta
+const MAPPING = 'config/mapping_v1.json';
+
+// --- Helpers num/fecha/string ---
+const two = (n) => String(n).padStart(2, '0');
+const toCents = (n) => Math.round(Number(n) * 100);
+const fromCents = (c) => Math.round(c) / 100;  // ← Agregar Math.round aquí
+
+function slugify(s) {
+  return String(s)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase()
+    .slice(0, 60);
+}
+function todayMX() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+function ymd(d) {
+  // 'YYYY-MM-DD' usando hora local (sin offset UTC)
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+}
+
+// Fecha local segura (sin saltos por zona horaria): 'YYYY-MM-DD'
+function ymdLocal(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+function fmtDMY(d) {
+  return `${two(d.getDate())}/${two(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
+function parseDateDMYLoose(txt) { // dd/mm/aaaa
+  const v = String(txt).trim().toLowerCase();
+  const m = v.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) throw new Error('Use formato dd/mm/aaaa.');
+  const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  if (isNaN(d)) throw new Error('Fecha inválida.');
+  return d;
+}
+function primera15o30(fechaEmision, preferencia) {
+  // Conserva el día 15 o 30 como referencia, ajustando febrero si es necesario.
+  const d = new Date(fechaEmision);
+  const diaRef = d.getDate() <= 15 ? 15 : 30;
+  // determine target month/year
+  const baseMonthOffset = preferencia === 'siguiente' ? 1 : 0;
+  const targetMonth = d.getMonth() + baseMonthOffset;
+  const year = d.getFullYear() + Math.floor(targetMonth / 12);
+  const month = targetMonth % 12;
+  // último día del mes destino
+  const lastDay = new Date(year, month + 1, 0).getDate();
+  // en febrero (o cualquier mes con menos días), reducir si es necesario
+  const day = diaRef > lastDay ? lastDay : diaRef;
+  return new Date(year, month, day);
+}
+
+// Avanza meses conservando siempre el día base (15 o 30) como referencia.
+// Ajusta febrero al último día (28 o 29) si el día base no existe en ese mes.
+function addMonthsKeepBaseDay(date, months, baseDay) {
+  const targetMonth = date.getMonth() + months;
+  const year = date.getFullYear() + Math.floor(targetMonth / 12);
+  const month = targetMonth % 12;
+  const lastDay = new Date(year, month + 1, 0).getDate();
+  const day = baseDay > lastDay ? lastDay : baseDay;
+  return new Date(year, month, day);
+}
+
+// --- Parsers tolerantes ---
+function parseMoneyLoose(txt) {
+  let s = String(txt).toLowerCase().trim();
+  s = s.replace(/\s+/g, ' ');
+  const hasK = /\bk\b/.test(s);
+  const hasMil = /\bmil\b/.test(s);
+  
+  // Eliminar símbolos de moneda y otros caracteres
+  s = s.replace(/[^0-9.,-]/g, '');
+  
+  // 🆕 NUEVA LÓGICA: Detectar si las comas son separadores de miles o decimales
+  if (s.includes(',') && s.includes('.')) {
+    // Tiene ambos: comas son miles, punto es decimal
+    s = s.replace(/,/g, ''); // 1,250.50 → 1250.50
+  } 
+  else if (s.includes(',')) {
+    // Solo tiene comas: analizar el patrón
+    const parts = s.split(',');
+    const lastPart = parts[parts.length - 1];
+    
+    // Si hay exactamente 3 dígitos después de la última coma → separador de miles
+    if (lastPart.length === 3 && parts.length >= 2) {
+      s = s.replace(/,/g, ''); // 250,000 → 250000 | 2,500 → 2500
+    } 
+    // Si hay 1 o 2 dígitos después de la coma → separador decimal
+    else if (lastPart.length <= 2) {
+      s = s.replace(',', '.'); // 10,5 → 10.5
+    }
+    // Múltiples comas espaciadas cada 3 dígitos → miles
+    else if (parts.length > 2 && parts.slice(1, -1).every(p => p.length === 3)) {
+      s = s.replace(/,/g, ''); // 1,250,000 → 1250000
+    }
+  }
+  
+  let n = Number(s || 0);
+  if (!isFinite(n)) throw new Error('Monto inválido.');
+  if (hasK || hasMil) n = n * 1000;
+  return Number(n.toFixed(2));
+}
+function parsePercentLoose(txt) {
+  const s = String(txt).trim().replace('%', '');
+  const n = Number(s);
+  if (!isFinite(n) || n < 0) throw new Error('Porcentaje inválido.');
+  return Number(n.toFixed(1));
+}
+function parseTelefono(txt) {
+  const s = String(txt).replace(/\D/g, '');
+  if (!(s.length === 10 || (s.length === 12 && s.startsWith('52'))))
+    throw new Error('Teléfono inválido (use 10 dígitos o +52…).');
+  return s;
+}
+
+// Devuelve true/false para sí/no y null si no es claro. Acepta variantes como "si", "sí", "yes", "no", "n".
+function parseYesNo(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (['si','sí','yes','y','true','1'].includes(s)) return true;
+  if (['no','n','false','0'].includes(s)) return false;
+  return null;
+}
+
+// Parser flexible de colindancias. Permite "14 | Calle", "14, Calle" o "14 Calle" y extrae metros y colinda.
+function parseColindancia(line) {
+  const s = String(line || '').trim();
+  let parts = s.split(/[|,]/);
+  if (parts.length >= 2) {
+    const metros = parts[0].replace(/[^\d.,]/g, '').replace(',', '.');
+    const colinda = parts.slice(1).join(' ').trim();
+    return { metros: metros || null, colinda: colinda || null };
+  }
+  const m = s.match(/^\s*([0-9]+(?:[.,][0-9]+)?)\s+(.*)$/i);
+  if (m) return { metros: m[1].replace(',', '.'), colinda: m[2].trim() || null };
+  const onlyNum = s.match(/^[0-9]+(?:[.,][0-9]+)?$/);
+  if (onlyNum) return { metros: s.replace(',', '.'), colinda: null };
+  return { metros: null, colinda: s };
+}
+
+// Divide testigos en dos nombres a partir de |, coma, punto y coma o slash. Capitaliza y recorta.
+function splitTestigos(v) {
+  const raw = String(v || '').replace(/\s+/g, ' ').trim();
+  const parts = raw.split(/[|,.;/]+/).map(s => s.trim()).filter(Boolean);
+  const [t1 = '', t2 = ''] = parts;
+  return {
+    testigo1: t1.toUpperCase(),
+    testigo2: t2.toUpperCase()
+  };
+}
+
+// Renderiza el menú principal. Se reutiliza en comandos globales.
+function renderMainMenu() {
+  return [
+    'Bienvenido 👋.',
+    '¿Qué deseas generar?',
+    '1. Contrato',
+    '2. Pagarés',
+    '3. Ambos',
+    '',
+    'Envía solo el número correspondiente:'
+  ].join('\n');
+}
+
+// --- Parser para género (hombre/mujer) ---
+function parseGenero(txt) {
+  const s = String(txt).trim().toLowerCase();
+  const male = ['h','hombre','masculino','el comprador','comprador'];
+  const female = ['m','mujer','femenino','la compradora','compradora'];
+  if (male.includes(s)) return 'EL COMPRADOR';
+  if (female.includes(s)) return 'LA COMPRADORA';
+  throw new Error('Responda Hombre/Mujer (H/M, masculino/femenino, comprador/compradora).');
+}
+
+// --- Parser para tipo de documento (contrato/pagarés/ambos) ---
+// Acepta números 1/2/3 o sus palabras en minúsculas. Devuelve
+// 'contrato', 'pagares' o 'ambos'. Lanza un error en cualquier otro caso.
+function parseDocType(txt) {
+  const s = String(txt).trim().toLowerCase();
+  // Normalizar acentos en "pagarés"
+  const sNorm = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  if (s === '1' || sNorm === 'contrato') return 'contrato';
+  if (s === '2' || sNorm === 'pagares' || sNorm === 'pagare' || sNorm === 'pagarés') return 'pagares';
+  if (s === '3' || sNorm === 'ambos') return 'ambos';
+  throw new Error('Tipo de documento inválido. Use 1 (contrato), 2 (pagarés) o 3 (ambos).');
+}
+
+// --- Parser de mes (nombre o número) ---
+// Devuelve un número del 1 al 12 según el nombre del mes en español o un número válido.
+function parseMesLoose(txt) {
+  const m = String(txt).trim().toLowerCase();
+  const map = {
+    'enero':1, 'febrero':2, 'marzo':3, 'abril':4, 'mayo':5, 'junio':6,
+    'julio':7, 'agosto':8, 'septiembre':9, 'setiembre':9,
+    'octubre':10, 'noviembre':11, 'diciembre':12
+  };
+  if (map[m]) return map[m];
+  const n = Number(m);
+  if (Number.isInteger(n) && n >= 1 && n <= 12) return n;
+  throw new Error('Mes inválido (use nombre de mes o 1..12).');
+}
+
+// --- Plan de pagos (centavos) ---
+function planPagosPorCents(saldo_c, mensual_c) {
+  const N = Math.ceil(saldo_c / mensual_c);
+  const montos = Array(N).fill(mensual_c);
+  const sobrepago = N * mensual_c - saldo_c;
+  let rest = sobrepago;
+  for (let i = N - 1; i >= 0 && rest > 0; i--) {
+    const can = Math.min(rest, montos[i] - 1);
+    montos[i] -= can;
+    rest -= can;
+  }
+  return montos;
+}
+
+// Calcula una lista detallada de pagarés a partir de los datos de la venta.
+// Esta función replica la lógica de generación de mensualidades y anualidades
+// utilizada en generarLoteYMeta pero sin escribir archivos. Devuelve un
+// arreglo de objetos: { folio, monto, fecha_vencimiento, tipo } donde
+// `folio` es un string con dos dígitos, `monto` es un número decimal,
+// `fecha_vencimiento` es una fecha ISO (YYYY-MM-DD) y `tipo` es
+// 'mensualidad' o 'anualidad'.
+function calcListaPagares(data) {
+  // Convertir valores a centavos para precisión
+  const saldo_c = toCents(data.saldo || (data.total - data.enganche));
+  const anual_c = toCents(data.anualidadMonto || 0);
+  const numAnn = Number(data.numeroAnualidades || 0);
+  const totalAnn_c = anual_c * numAnn;
+  // Validar que las anualidades no excedan el saldo
+  const saldoMens_c = saldo_c - totalAnn_c;
+  const mens_c = toCents(data.mensual || 0);
+  // Generar mensualidades (en centavos)
+  const montosMens = planPagosPorCents(saldoMens_c, mens_c);
+  // Calcular primer vencimiento y día base
+  const fechaEmision = data.fechaEmision instanceof Date ? data.fechaEmision : new Date(data.fechaEmision);
+  let venc = primera15o30(fechaEmision, data.reglaPref || 'mismo');
+  const baseDay = fechaEmision.getDate() <= 15 ? 15 : 30;
+  let annRestantes = numAnn;
+  let folioContador = 0;
+  const lista = [];
+  // Intercalar mensualidades y anualidades
+  for (let i = 0; i < montosMens.length; i++) {
+    folioContador++;
+    const folioStr = two(folioContador);
+    // Mensualidad
+    lista.push({
+      folio: folioStr,
+      monto: Number(fromCents(montosMens[i]).toFixed(2)),
+      fecha_vencimiento: ymdLocal(venc),
+      tipo: 'mensualidad'
+    });
+    // Anualidad en el mismo mes si corresponde
+    const mesVenc = venc.getMonth() + 1;
+    if (annRestantes > 0 && mesVenc === (data.anualidadMes || 12)) {
+      folioContador++;
+      const folioAnnStr = two(folioContador);
+      lista.push({
+        folio: folioAnnStr,
+        monto: Number(fromCents(anual_c).toFixed(2)),
+        fecha_vencimiento: ymdLocal(venc),
+        tipo: 'anualidad'
+      });
+      annRestantes--;
+    }
+    // Avanzar un mes conservando el día base
+    venc = addMonthsKeepBaseDay(venc, 1, baseDay);
+  }
+  // Generar anualidades restantes (si las mensualidades terminaron antes)
+  while (annRestantes > 0) {
+    const mesVenc = venc.getMonth() + 1;
+    if (mesVenc === (data.anualidadMes || 12)) {
+      folioContador++;
+      const folioAnnStr = two(folioContador);
+      lista.push({
+        folio: folioAnnStr,
+        monto: Number(fromCents(anual_c).toFixed(2)),
+        fecha_vencimiento: ymdLocal(venc),
+        tipo: 'anualidad'
+      });
+      annRestantes--;
+    }
+    venc = addMonthsKeepBaseDay(venc, 1, baseDay);
+  }
+
+// === REORDENAR: mensualidades primero, anualidades al final ===
+const mens = lista.filter(p => p.tipo === 'mensualidad');
+const ann  = lista.filter(p => p.tipo === 'anualidad');
+const combined = [...mens, ...ann];
+
+// reasignar folios
+for (let i = 0; i < combined.length; i++) {
+  combined[i].folio = (i + 1).toString().padStart(2, '0');
+}
+
+return combined;
+}
+
+// === Reordenado final: mensualidades primero; anualidades al final (fechas intactas) ===
+function ordenarPagaresMensualidadesLuegoAnualidades(listaOriginal) {
+  if (!Array.isArray(listaOriginal)) return [];
+  
+  const isMens = (p) => (p.tipo || '').toLowerCase().includes('mensual');
+  const isAnnu = (p) => (p.tipo || '').toLowerCase().includes('anual');
+  
+  // 1) Particionar por tipo
+  const mens = [];
+  const ann  = [];
+  for (const p of listaOriginal) {
+   if (isAnnu(p)) ann.push(p); else mens.push(p);
+  }
+  
+  // 2) Orden por fecha dentro de cada grupo (no tocamos fechas)
+  const byFecha = (a, b) => String(a.fecha_vencimiento).localeCompare(String(b.fecha_vencimiento));
+  mens.sort(byFecha);
+  ann.sort(byFecha);
+  
+  // 3) Concatenar y re-foliar 01..NN
+  const combinada = [...mens, ...ann].map((p, idx) => {
+   const folio2d = String(idx + 1).padStart(2, '0');
+   return { ...p, folio: folio2d, FOLIO: folio2d };
+  });
+  
+  return combinada;
+  }
+
+// --- Estado por chat ---
+function baseData() {
+  return {
+    total: 0, enganche: 0, saldo: 0, mensual: 0,
+    beneficiario: '', deudor: '', direccion: '', poblacion: '',
+    lugarExpedicion: '', lugarPago: '',
+    fechaEmision: todayMX(),
+    moratorios: 0,
+    telefono: '',
+    reglaPref: 'mismo',
+    // Campos para anualidades especiales
+    anualidadMonto: 0,
+    numeroAnualidades: 0,
+    // Mes de vencimiento de las anualidades (1..12, default diciembre)
+    anualidadMes: 12
+    ,
+    // Tipo de documento a generar ("contrato", "pagares" o "ambos")
+    tipoDocumento: 'ambos',
+    // Número calculado de pagarés (mensualidades + anualidades)
+    numeroPagares: 0,
+    // Interés anual específico del contrato (cláusula cuarta). Si no se establece se usará moratorios.
+    interes: 0
+  };
+}
+
+// Drafts para previsualización/edición por chat
+// Map<chatId, { data, mode: 'preview'|'editing', lastPreviewAt?:number }>
+const DRAFTS = new Map();
+
+// Construye el PDF "print" del lote en memoria (sin guardar) a partir de los datos acumulados
+async function buildLoteBuffer(data){
+  // Nuevo cálculo de plan: incluye anualidades especiales
+  // Usamos el saldo real (total - enganche) ya almacenado en data.saldo
+  const saldo_c = toCents(data.saldo);
+  const anual_c = toCents(data.anualidadMonto || 0);
+  const numAnn = data.numeroAnualidades || 0;
+  const totalAnn_c = anual_c * numAnn;
+  if (totalAnn_c > saldo_c) {
+    throw new Error('Las anualidades exceden el saldo.');
+  }
+  const saldoMens_c = saldo_c - totalAnn_c;
+  const mens_c = toCents(data.mensual);
+  const montosMens = planPagosPorCents(saldoMens_c, mens_c);
+  const totalPagares = montosMens.length + numAnn;
+
+  // Primer vencimiento
+  let venc = primera15o30(data.fechaEmision, data.reglaPref);
+  // Día base (15 o 30) según la fecha de emisión original
+  const baseDay = data.fechaEmision.getDate() <= 15 ? 15 : 30;
+
+  const merger = await PDFDocument.create();
+
+  // control de anualidades restantes
+  let annRestantes = numAnn;
+  let folioContador = 0;
+
+  // Iterar mensualidades
+  for (let i = 0; i < montosMens.length; i++) {
+    // pagaré mensual
+    folioContador++;
+    const folioNum = folioContador;
+    const payloadMens = {
+      deudor: {
+        nombre: data.deudor,
+        direccion: data.direccion,
+        poblacion: data.poblacion
+      },
+      beneficiario: { nombre: data.beneficiario },
+      pagare: {
+        folio: folioNum,
+        numeroDePagares: totalPagares,
+        monto: fromCents(montosMens[i]),
+        lugarDePago: data.lugarPago,
+        lugarExpedicion: data.lugarExpedicion,
+        fechaEmision: data.fechaEmision.toISOString(),
+        fechaVencimiento: venc.toISOString(),
+        moratorios: data.moratorios,
+        // qr_text: (anulado por parche unificado)
+      }
+    };
+  // {
+//   const indBuf = await renderToBuffer(path.join(__dirname,'..','config','mapping_v1.json'), payloadMens);
+//   const indDoc = await PDFDocument.load(indBuf);
+//   const [page] = await merger.copyPages(indDoc, [0]);
+//   merger.addPage(page);
+// }
+
+    // si en este mes toca anualidad
+    const mesVenc = venc.getMonth() + 1;
+    if (annRestantes > 0 && mesVenc === (data.anualidadMes || 12)) {
+      folioContador++;
+      const folioAnn = folioContador;
+      const payloadAnn = {
+        deudor: {
+          nombre: data.deudor,
+          direccion: data.direccion,
+          poblacion: data.poblacion
+        },
+        beneficiario: { nombre: data.beneficiario },
+        pagare: {
+          folio: folioAnn,
+          numeroDePagares: totalPagares,
+          monto: fromCents(anual_c),
+          lugarDePago: data.lugarPago,
+          lugarExpedicion: data.lugarExpedicion,
+          fechaEmision: data.fechaEmision.toISOString(),
+          fechaVencimiento: venc.toISOString(),
+          moratorios: data.moratorios,
+          // qr_text: (anulado por parche unificado)
+        }
+      };
+     // {
+       // const indBufAnn = await renderToBuffer(path.join(__dirname,'..','config','mapping_v1.json'), payloadAnn);
+       // const indDocAnn = await PDFDocument.load(indBufAnn);
+        //const [pageAnn] = await merger.copyPages(indDocAnn, [0]);
+       // merger.addPage(pageAnn);
+      //}
+      annRestantes--;
+    }
+    // avanzar un mes
+    venc = addMonthsKeepBaseDay(venc, 1, baseDay);
+  }
+  // Si todavía hay anualidades que no se intercalaron (ej. cuando mensualidades se acabaron antes de tener suficientes meses con anualidad)
+  while (annRestantes > 0) {
+    const mesVenc = venc.getMonth() + 1;
+    if (mesVenc === (data.anualidadMes || 12)) {
+      folioContador++;
+      const folioAnn = folioContador;
+      const payloadAnn = {
+        deudor: {
+          nombre: data.deudor,
+          direccion: data.direccion,
+          poblacion: data.poblacion
+        },
+        beneficiario: { nombre: data.beneficiario },
+        pagare: {
+          folio: folioAnn,
+          numeroDePagares: totalPagares,
+          monto: fromCents(anual_c),
+          lugarDePago: data.lugarPago,
+          lugarExpedicion: data.lugarExpedicion,
+          fechaEmision: data.fechaEmision.toISOString(),
+          fechaVencimiento: venc.toISOString(),
+          moratorios: data.moratorios,
+          // qr_text: (anulado por parche unificado)
+        }
+      };
+      //{
+       // const indBufAnn = await renderToBuffer(path.join(__dirname,'..','config','mapping_v1.json'), payloadAnn);
+       // const indDocAnn = await PDFDocument.load(indBufAnn);
+       // const [pageAnn] = await merger.copyPages(indDocAnn, [0]);
+       // merger.addPage(pageAnn);
+      //}
+      annRestantes--;
+    }
+    // siempre avanzar un mes hasta cubrir todas las anualidades
+    venc = addMonthsKeepBaseDay(venc, 1, baseDay);
+  }
+  const bytes = await merger.save();
+  return Buffer.from(bytes);
+}
+
+// --- Pasos del flujo ---
+const STEPS = [
+  // Paso inicial: seleccionar el tipo de documento a generar (contrato, pagarés o ambos)
+  {
+    key: 'docType',
+    ask: '👋 ¿Qué deseas generar?\n1. Contrato\n2. Pagarés\n3. Ambos\n\nEnvía solo el número correspondiente:',
+    parse: (t, d) => {
+      const v = String(t).trim().toLowerCase();
+      // Permitir números o palabras como alias
+      if (v === '1' || v === 'contrato') {
+        d.tipoDocumento = 'contrato';
+      } else if (v === '2' || v === 'pagares' || v === 'pagarés') {
+        d.tipoDocumento = 'pagares';
+      } else if (v === '3' || v === 'ambos') {
+        d.tipoDocumento = 'ambos';
+      } else {
+        throw new Error('Responde 1 (Contrato), 2 (Pagarés) o 3 (Ambos).');
+      }
+    }
+  },
+  { key:'total',        ask:'💰 Indique el **costo total del lote** (ejemplo: 10000, $10,000, 10 mil):', parse:(t,d)=>{ const n=parseMoneyLoose(t); if(n<=0) throw Error('Monto inválido.'); d.total=n; } },
+  { key:'enganche',     ask:'💵 ¿Cuál será el **enganche**? (escriba 0 si no habrá):', parse:(t,d)=>{ const n=parseMoneyLoose(t); if(n<0||n>d.total) throw Error('Enganche inválido.'); d.enganche=n; d.saldo=Number((d.total-n).toFixed(2)); } },
+  { key:'mensual',      ask:'📅 ¿De cuánto será la **mensualidad**? (formato libre):', parse:(t,d)=>{ const n=parseMoneyLoose(t); if(n<=0) throw Error('Mensualidad inválida.'); d.mensual=n; } },
+
+  // Preguntas para anualidades especiales (después de mensualidad)
+  { key:'anualidadesSiNo',
+    ask:'🎯 ¿Habrá **anualidades especiales** además de las mensualidades? (sí/no)',
+    parse:(t,d)=>{
+      const yn = parseYesNo(t);
+      if (yn === null) throw Error('Responda "sí" o "no".');
+      d._tieneAnualidades = yn;
+      if (!yn) {
+        // Si el usuario indica que no habrá anualidades, fijamos valores por defecto
+        d.anualidadMonto = 0;
+        d.numeroAnualidades = 0;
+        d.anualidadMes = 12;
+      }
+    }
+  },
+  { key:'anualidadMonto',
+    ask:'💎 ¿De cuánto será **cada anualidad**? (ej. 18500). Si no hay, escriba 0.',
+    parse:(t,d)=>{
+      // Si no hay anualidades, ignoramos este valor y mantenemos 0
+      if (!d._tieneAnualidades) {
+        d.anualidadMonto = 0;
+        return;
+      }
+      const n = parseMoneyLoose(t);
+      if (n <= 0) throw Error('Monto de anualidad inválido.');
+      d.anualidadMonto = n;
+    }
+  },
+  { key:'numeroAnualidades',
+    ask:'🔢 ¿Cuántas **anualidades** serán en total? (ej. 8). Si no hay, 0.',
+    parse:(t,d)=>{
+      // Si no hay anualidades, fijamos 0
+      if (!d._tieneAnualidades) {
+        d.numeroAnualidades = 0;
+        return;
+      }
+      const n = Number(String(t).trim());
+      if (!Number.isInteger(n) || n <= 0) throw Error('Indique un número mayor que 0.');
+      d.numeroAnualidades = n;
+    }
+  },
+  { key:'anualidadMes',
+    ask:'🗓️ ¿En qué **mes** vence cada anualidad? (nombre de mes o 1..12). Sugerencia: "diciembre".',
+    parse:(t,d)=>{
+      if (!d._tieneAnualidades) {
+        // por defecto diciembre
+        d.anualidadMes = 12;
+        return;
+      }
+      d.anualidadMes = parseMesLoose(t);
+    }
+  },
+
+  { key:'beneficiario', ask:'👤 Beneficiario (a la orden de):', parse:(t,d)=>{ const v=t.trim(); if(!v) throw Error('Escriba un nombre.'); d.beneficiario=v; } },
+  { key:'deudor',       ask:'🙋 Nombre del deudor:',          parse:(t,d)=>{ const v=t.trim(); if(!v) throw Error('Escriba un nombre.'); d.deudor=v; } },
+  { key:'direccion',    ask:'🏠 Dirección del deudor:',        parse:(t,d)=>{ const v=t.trim(); if(!v) throw Error('Escriba una dirección.'); d.direccion=v; } },
+  { key:'poblacion',    ask:'🏙️ Población del deudor:',       parse
+  :(t,d)=>{ const v=t.trim(); if(!v) throw Error('Escriba una población.'); d.poblacion=v; } },
+
+  { key:'lugarExp',     ask:'📍 Lugar de expedición:',         parse:(t,d)=>{ const v=t.trim(); if(!v) throw Error('Escriba un lugar.'); d.lugarExpedicion=v; } },
+  { key:'lugarPago',    ask:'🏦 ¿Lugar de pago? (escriba "**sí**" si es igual al de expedición, o indique otro):', parse:(t,d)=>{
+      const raw = String(t).trim();
+      const v = raw.toLowerCase();
+      const yn = parseYesNo(v);
+      if (yn === true || ['mismo','igual'].includes(v)) {
+        d.lugarPago = d.lugarExpedicion;
+      } else if (yn === false) {
+        // Respuesta negativa no es válida aquí: debe especificar un lugar
+        throw new Error('Indique "sí" o el nuevo lugar.');
+      } else {
+        d.lugarPago = raw;
+      }
+      if (!d.lugarPago) throw new Error('Indique "sí" o el nuevo lugar.');
+    } },
+
+  // Fecha: HOY por defecto; solo cambia si escribe dd/mm/aaaa válido
+  { 
+    key: 'fechaEmision',
+    ask: () => `🗓️ Usaré la **fecha de HOY** (${fmtDMY(todayMX())}) como fecha de emisión. Si necesita otra, escríbala en **dd/mm/aaaa**:`,
+    parse: (t, d) => {
+      const raw = String(t).trim().toLowerCase();
+      const m = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+      d.fechaEmision = m ? parseDateDMYLoose(raw) : todayMX();
+    }
+  },
+
+  { key:'moratorios',   ask:'⚠️ Interés moratorio (%)',        parse:(t,d)=>{ d.moratorios=parsePercentLoose(t); } },
+  // Paso adicional: interés anual para la cláusula cuarta (se permite cero si no aplica)
+  { key:'interes',     ask:'💹 Indique la **tasa de interés anual (%)** para la cláusula cuarta (escriba 0 si no aplica):', parse:(t,d)=>{ const v=parsePercentLoose(t); if (v < 0) throw Error('Porcentaje inválido'); d.interes = v; } },
+  { key:'telefono',     ask:'📞 Teléfono del cliente (10 dígitos o +52…):', parse:(t,d)=>{ d.telefono=parseTelefono(t); } },
+
+  { key:'regla1530',
+    ask:'📆 Para la **regla 15/30**, ¿el primer pago es en **este mes** o en el **mes siguiente**?',
+    parse:(t,d)=>{
+      // Normalizar tildes y espacios; aceptar variantes como "siguiente mes", "proximo mes", "mes proximo"
+      const raw = String(t || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim()
+        .toLowerCase();
+      // Sinónimos de "este mes" (mismo mes)
+      const esActual = ['este mes','este','mismo'];
+      // Sinónimos de "mes siguiente" (siguiente mes)
+      const esSiguiente = ['mes siguiente','siguiente mes','siguiente','proximo mes','mes proximo','prox mes','proximo'];
+      if (esActual.includes(raw)) {
+        d.reglaPref = 'mismo';
+        return;
+      }
+      if (esSiguiente.includes(raw)) {
+        d.reglaPref = 'siguiente';
+        return;
+      }
+      throw new Error('Responda "este mes" o "mes siguiente".');
+    }
+  },
+
+  { key:'confirm',      ask:'✅ Revise y escriba **CONFIRMAR**, **EDITAR <campo>** o **CANCELAR**.', parse:()=>{} },
+];
+
+// === Pasos adicionales para el contrato ===
+// Estos pasos solicitan datos del inmueble y otras cláusulas legales. Se insertarán antes de la regla 15/30.
+const CONTRACT_STEPS = [
+  {
+    key: 'genero',
+    ask: '👤 ¿Género del comprador? (Hombre/Mujer)',
+    parse: (t, d) => { d.genero = parseGenero(t); }
+  },
+  {
+    key: 'nombre_predio',
+    ask: '🏷️ Nombre del predio:',
+    parse: (t, d) => { d['nombre predio'] = String(t).trim(); }
+  },
+  {
+    key: 'ubicacion_predio',
+    ask: '📌 Ubicación completa del predio:',
+    parse: (t, d) => { d['ubicación predio'] = String(t).trim(); }
+  },
+  {
+    key: 'municipio_predio',
+    ask: '🏛️ Municipio del predio:',
+    parse: (t, d) => { d['municipio predio'] = String(t).trim(); }
+  },
+  {
+    key: 'manzana_lotes',
+    ask: '🧭 Manzana y lote(s):',
+    parse: (t, d) => { d['manzana y lote(s)'] = String(t).trim(); }
+  },
+  {
+    key: 'sup_num',
+    ask: '📏 Superficie (número en m²):',
+    // Calcula automáticamente la superficie en letras a partir del número ingresado
+    parse: (t, d) => {
+      const raw = String(t).trim();
+      d['superficie numero'] = raw;
+      let num = parseFloat(raw.replace(/[^0-9.]/g, ''));
+      if (!isFinite(num)) num = 0;
+      try {
+        if (typeof numeroALetras === 'function') {
+          d['superficie letra'] = String(numeroALetras(Math.round(num))).toUpperCase();
+        } else {
+          d['superficie letra'] = '';
+        }
+      } catch (_) {
+          d['superficie letra'] = '';
+      }
+    }
+  },
+  // Eliminamos el paso sup_letra porque la superficie en letras se calcula automáticamente
+  {
+    key: 'norte',
+    ask: '🧭 Norte – responda: metros | colinda',
+    parse: (t, d) => {
+      const { metros, colinda } = parseColindancia(t);
+      d['norte numero'] = metros || '';
+      d['colindancia norte'] = colinda || '';
+    }
+  },
+  {
+    key: 'sur',
+    ask: '🧭 Sur – responda: metros | colinda',
+    parse: (t, d) => {
+      const { metros, colinda } = parseColindancia(t);
+      d['sur numero'] = metros || '';
+      d['colindancia sur'] = colinda || '';
+    }
+  },
+  {
+    key: 'oriente',
+    ask: '🧭 Oriente – responda: metros | colinda',
+    parse: (t, d) => {
+      const { metros, colinda } = parseColindancia(t);
+      d['oriente numero'] = metros || '';
+      d['colindancia oriente'] = colinda || '';
+    }
+  },
+  {
+    key: 'poniente',
+    ask: '🧭 Poniente – responda: metros | colinda',
+    parse: (t, d) => {
+      const { metros, colinda } = parseColindancia(t);
+      d['poniente numero'] = metros || '';
+      d['colindancia poniente'] = colinda || '';
+    }
+  },
+  {
+    key: 'testigos',
+    ask: '🧾 Testigos – responda: testigo1 | testigo2',
+    parse: (t, d) => {
+      const { testigo1, testigo2 } = splitTestigos(t);
+      d['testigo1'] = testigo1;
+      d['testigo2'] = testigo2;
+    }
+  }
+];
+
+// Insertamos los pasos del contrato justo antes de la regla 15/30 para que se ejecuten en la misma sesión
+{
+  const idxRegla = STEPS.findIndex(s => s.key === 'regla1530');
+  if (idxRegla !== -1) {
+    STEPS.splice(idxRegla, 0, ...CONTRACT_STEPS);
+  }
+}
+
+// Claves de pasos exclusivos del contrato. Esto permite saltarlos automáticamente si
+// el usuario indicó que sólo desea generar pagarés.
+// Lista de claves de pasos exclusivos del contrato.  Además de los pasos de
+// CONTRACT_STEPS, incluimos el paso de interés anual para que se omita al
+// generar únicamente pagarés.
+const CONTRATO_KEYS = CONTRACT_STEPS.map(s => s.key).concat(['interes']);
+
+// Claves de pasos exclusivos de anualidades. Estos pasos se omiten automáticamente
+// cuando el usuario responde que no habrá anualidades (d._tieneAnualidades === false).
+const ANUAL_KEYS = ['anualidadMonto','numeroAnualidades','anualidadMes'];
+
+// --- Resumen humano ---
+function resumenVenta(d) {
+  // Número de pagarés: mensualidades + anualidades
+  const saldo_c = toCents(d.saldo);
+  const anual_c = toCents(d.anualidadMonto || 0);
+  const numAnn = d.numeroAnualidades || 0;
+  const saldoMens_c = saldo_c - anual_c * numAnn;
+  let N = 0;
+  try {
+    const mens_c  = toCents(d.mensual);
+    const montosMens = planPagosPorCents(saldoMens_c, mens_c);
+    N = montosMens.length + numAnn;
+  } catch (_) {
+    // Si hay error en cálculo, dejar N en 0
+    N = numAnn;
+  }
+  const out = [];
+  out.push('📋 *Resumen de venta*');
+  out.push(`Total: $${d.total.toLocaleString('es-MX',{minimumFractionDigits:2})}`);
+  out.push(`Enganche: $${d.enganche.toLocaleString('es-MX',{minimumFractionDigits:2})}`);
+  out.push(`Saldo: $${d.saldo.toLocaleString('es-MX',{minimumFractionDigits:2})}`);
+  out.push(`Mensualidad: $${d.mensual.toLocaleString('es-MX',{minimumFractionDigits:2})}`);
+  // Guardar el número de pagarés calculado para uso posterior
+  d.numeroPagares = N;
+  out.push(`Número de pagarés: ${N}`);
+  // Mostrar anualidades si existen
+  if (numAnn > 0 && anual_c > 0) {
+    out.push(`Anualidad: $${d.anualidadMonto.toLocaleString('es-MX',{minimumFractionDigits:2})} x ${numAnn} (mes ${d.anualidadMes})`);
+  }
+  out.push(`Beneficiario: ${d.beneficiario}`);
+  out.push(`Deudor: ${d.deudor}`);
+  out.push(`Dirección: ${d.direccion}`);
+  out.push(`Población: ${d.poblacion}`);
+  out.push(`Lugar Expedición: ${d.lugarExpedicion}`);
+  out.push(`Lugar Pago: ${d.lugarPago}`);
+  out.push(`Fecha Emisión: ${fmtDMY(d.fechaEmision)}`);
+  out.push(`Moratorios: ${d.moratorios}%`);
+  // Mostrar interés anual si está definido
+  if (typeof d.interes === 'number') {
+    out.push(`Interés anual: ${d.interes}%`);
+  }
+  // Mostrar el tipo de documento seleccionado
+  if (d.tipoDocumento) {
+    out.push(`Tipo de documento: ${d.tipoDocumento}`);
+  }
+  out.push(`Teléfono: ${d.telefono}`);
+  return out.join('\n');
+}
+
+// --- Generación de PDFs + meta.json en carpeta de cliente/venta ---
+async function generarLoteYMeta(d) {
+  // Paths de cliente/venta
+  const clienteSlug = slugify(d.deudor || 'CLIENTE');
+  const ventaId = Date.now();
+  const ventaFechaDir = ymd(d.fechaEmision);
+  const baseDir = path.join(OUTPUT_ROOT, clienteSlug, ventaFechaDir);
+
+  const dirLote = path.join(baseDir, 'lote');
+  const dirInd  = path.join(baseDir, 'individuales');
+  fs.mkdirSync(dirLote, { recursive: true });
+  fs.mkdirSync(dirInd,  { recursive: true });
+  // === auditoría por pagaré ===
+const dirAudit = path.join(dirInd, 'audit');
+fs.mkdirSync(dirAudit, { recursive: true });
+
+// IDs canónicos base, para alinear contrato/pagaré/fotos
+const baseDocId = `LIA-${clienteSlug}-${ventaFechaDir}-${ventaId}`;
+
+  // Económico y plan con anualidades especiales
+  const saldo_c = toCents(d.saldo);
+  const anual_c = toCents(d.anualidadMonto || 0);
+  const numAnn = d.numeroAnualidades || 0;
+  const totalAnn_c = anual_c * numAnn;
+  if (totalAnn_c > saldo_c) {
+    throw new Error('Las anualidades exceden el saldo.');
+  }
+  const saldoMens_c = saldo_c - totalAnn_c;
+  const mens_c  = toCents(d.mensual);
+  const montosMens = planPagosPorCents(saldoMens_c, mens_c);
+  
+  // Primer vencimiento y PDF merger
+  let venc = primera15o30(d.fechaEmision, d.reglaPref);
+  // Día base (15 o 30) según la fecha de emisión original
+  const baseDay = d.fechaEmision.getDate() <= 15 ? 15 : 30;
+  const merger = await PDFDocument.create();
+
+  // Detalle por pagaré para meta.json
+  const pagarésMeta = [];
+
+  let annRestantes = numAnn;
+  let folioContador = 0;
+
+// === NUEVO: recorrer lista final ORDENADA por calcListaPagares ===
+const listaFinal = calcListaPagares(d); // mensualidades primero; anualidades al final
+const totalPagares = listaFinal.length;
+
+for (const p of listaFinal) {
+  const folioNum = Number(p.folio);
+  const folioStr = two(folioNum);
+  
+  // Parse seguro local: 'YYYY-MM-DD' -> Date (zona local) evita -1 día
+  const [vy, vm, vd] = String(p.fecha_vencimiento).split('-').map(Number);
+  const venc = new Date(vy, (vm || 1) - 1, vd || 1);
+ // ya viene calculada (regla 15/30 + feb 28/29)
+
+  const payload = {
+    deudor: {
+      nombre: d.deudor,
+      direccion: d.direccion,
+      poblacion: d.poblacion
+    },
+    beneficiario: { nombre: d.beneficiario },
+    pagare: {
+      folio: folioNum,
+      numeroDePagares: totalPagares,
+      monto: Number(p.monto), // decimal
+      lugarDePago: d.lugarPago,
+      lugarExpedicion: d.lugarExpedicion,
+      fechaEmision: d.fechaEmision.toISOString(),
+      fechaVencimiento: venc.toISOString(),
+      moratorios: d.moratorios,
+      // qr_text: (anulado por parche unificado)
+    }
+  };
+
+// === Doble pase de auditoría por pagaré ===
+// 0) ID canónico por pagaré
+const docIdPagare = `${baseDocId}-P${folioStr}`;
+
+// 1) PRE-HASH (render base SIN QR de plantilla)
+// A) Si tienes renderToBuffer disponible (lo vi importado):
+const payloadNoQr = JSON.parse(JSON.stringify(payload));
+if (payloadNoQr?.pagare) delete payloadNoQr.pagare.qr_text;
+const preBuf  = await renderToBuffer(MAPPING, payloadNoQr);
+const preHash = await sha256HexFromBuffer(preBuf);
+
+// === QR unificado (base/doc/folio/monto/emision/h) ===
+const shortHash  = preHash.slice(0, 10);
+const emisionISO = (payload?.pagare?.emision) || d.fechaEmision.toISOString();
+
+payload.pagare = payload.pagare || {};
+payload.pagare.qr_text = JSON.stringify({
+  base: baseDocId,
+  doc:  `${baseDocId}-P${folioStr}`,
+  folio: Number(folioStr),
+  monto: Number(p.monto),
+  emision: emisionISO,
+  h: shortHash,           // hash corto del preHash
+  preHash,                // hash completo antes del QR
+  postHash: "(por calcular)"
+});
+
+// el mapping ahora leerá "qr" (asegúrate que en mapping_v1.json tengas: "QR": { "from": "qr" })
+payload.qr = payload.pagare.qr_text;
+
+// === Render FINAL del pagaré (con QR correcto) ===
+const indPath = path.join(dirInd, `PAGARE_${folioStr}.pdf`);
+// opcional debug: escribir el texto que irá codificado en el QR
+// fs.writeFileSync(indPath.replace(/\.pdf$/i, '.qr.txt'), String(payload.qr || ''), 'utf8');
+await renderToFile(MAPPING, payload, indPath);
+
+// 3) POST-HASH del PDF final
+const postHash = await sha256HexFromFile(indPath);
+
+// 4) AUDIT JSON atómico por pagaré
+const { auditPath, shortHash: qrShort } = writePagareAuditJson({
+  outDir: dirAudit,
+  baseDocId,
+  docId: docIdPagare,
+  clienteSlug,
+  ventaId,
+  folio: folioStr,
+  deudor: d.deudor,                      // usa tu variable real de deudor
+  monto: Number(p.monto).toFixed(2),     // asegura 2 decimales
+  venceISO: venc.toISOString(),
+  venceDMY: fmtDMY(venc),
+  preHash,
+  postHash,
+  pdfPath: indPath
+});
+
+// 5) Agregar la página final (ya con QR) al PDF “LOTE”
+{
+  const bytes = fs.readFileSync(indPath);
+  const doc = await PDFDocument.load(bytes);
+  const [page] = await merger.copyPages(doc, [0]);
+  merger.addPage(page);
+}
+
+// 6) Enriquecer meta.json
+pagarésMeta.push({
+  folio: folioStr,
+  monto: Number(Number(p.monto).toFixed(2)),
+  vence: fmtDMY(venc),
+  audit_json: auditPath,
+  pre_hash: preHash,
+  post_hash: postHash,
+  qr_short: qrShort,
+  doc_id: docIdPagare,
+  base_id: baseDocId
+});
+
+}
+
+  // Guardar lote
+  const lotePath = path.join(dirLote, `lote_${ventaId}.pdf`);
+  fs.writeFileSync(lotePath, await merger.save());
+
+  // Guardar meta.json
+  const meta = {
+    venta_id: String(ventaId),
+    cliente_slug: clienteSlug,
+    fecha_venta: fmtDMY(d.fechaEmision),
+    contacto: { telefono: d.telefono },
+    beneficiario: d.beneficiario,
+    deudor: {
+      nombre: d.deudor,
+      direccion: d.direccion,
+      poblacion: d.poblacion
+    },
+    economico: {
+      total: Number(d.total.toFixed(2)),
+      enganche: Number(d.enganche.toFixed(2)),
+      saldo: Number(d.saldo.toFixed(2)),
+      mensualidad: Number(d.mensual.toFixed(2)),
+      // El número de pagarés incluye mensualidades y anualidades
+      numero_pagares: totalPagares,
+      moratorios_pct: d.moratorios
+    },
+    documento: {
+      lugar_expedicion: d.lugarExpedicion,
+      lugar_pago: d.lugarPago,
+      fecha_emision: fmtDMY(d.fechaEmision),
+      regla_1530: d.reglaPref
+    },
+    archivos: {
+      base_dir: baseDir,
+      lote_pdf: lotePath,
+      individuales_dir: dirInd
+    },
+    pagares: pagarésMeta
+  };
+  fs.writeFileSync(path.join(baseDir, 'meta.json'), JSON.stringify(meta, null, 2));
+
+  return { baseDir, lotePath, meta, clienteSlug, ventaFechaDir };
+}
+
+// --- Decodificar QR desde imagen buffer (JPG/PNG) ---
+async function decodeQRFromBuffer(buf) {
+  const img = await Jimp.read(buf);
+  return new Promise((resolve, reject) => {
+    const qr = new QrCode();
+    qr.callback = (err, value) => {
+      if (err) return reject(err);
+      resolve(value ? String(value.result) : '');
+    };
+    qr.decode(img.bitmap);
+  });
+}
+
+// --- Parsear texto "VENTA=...|CLIENTE=...|FOLIO=..." ---
+function parseQRText(s) {
+  const out = {};
+  String(s).split('|').forEach(pair => {
+    const [k, v] = pair.split('=');
+    if (k && v) out[k.trim().toUpperCase()] = v.trim();
+  });
+  return out;
+}
+
+// --- Buscar meta.json a partir de CLIENTE y/o VENTA ---
+function findMetaByQR(qrObj) {
+  // Preferimos venta + cliente
+  const cliente = (qrObj.CLIENTE || '').toUpperCase();
+  // Recorrer estructura: data/clientes/<CLIENTE>/<YYYY-MM-DD>/meta.json
+  const clienteDir = path.join(OUTPUT_ROOT, cliente);
+  if (!cliente || !fs.existsSync(clienteDir)) return null;
+
+  // Buscar en subcarpetas por fecha
+  const fechas = fs.readdirSync(clienteDir, { withFileTypes: true })
+                   .filter(d => d.isDirectory()).map(d => d.name);
+  for (const fecha of fechas) {
+    const metaPath = path.join(clienteDir, fecha, 'meta.json');
+    if (fs.existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        // Si mandaron VENTA, validamos
+        if (qrObj.VENTA && meta.venta_id && String(meta.venta_id) === String(qrObj.VENTA)) {
+          return { meta, baseDir: path.join(clienteDir, fecha) };
+        }
+        // Si no hay VENTA, igual devolvemos el más reciente (heurística)
+      } catch (_) {}
+    }
+  }
+  // Si no hubo match exacto por VENTA, devolvemos el más reciente (si existe)
+  const fechasSorted = fechas.sort().reverse();
+  for (const fecha of fechasSorted) {
+    const metaPath = path.join(clienteDir, fecha, 'meta.json');
+    if (fs.existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        return { meta, baseDir: path.join(clienteDir, fecha) };
+      } catch (_) {}
+    }
+  }
+  return null;
+}
+
+// --- WhatsApp client ---
+const client = new Client({
+  authStrategy: new LocalAuth({
+    // Ruta de sesión persistente (symlink a shared/.wwebjs_auth en deploy)
+    dataPath: process.env.SESSION_PATH || process.env.WWEBJS_DIR || path.resolve('.wwebjs_auth')
+  }),
+  puppeteer: {
+    // En Node 22 es preferible usar headless:'new' para evitar bugs con páginas pesadas
+    // Véase: https://github.com/puppeteer/puppeteer/releases/tag/v21.4.0
+    headless: 'new',
+    // Aumentamos el tiempo de espera de navegación para evitar errores net::ERR_TIMED_OUT
+    protocolTimeout: 180000,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--disable-features=site-per-process'
+    ]
+  },
+  // Evita cachear la versión de WhatsApp Web para minimizar fallos al cargar
+  webVersionCache: {
+    type: 'none'
+  }
+});
+
+client.on('qr', qr => { console.log('\nEscanee este QR:\n'); try { qrt.generate(qr, { small:true }); } catch(e){ console.log('QR (raw):', qr); } });
+client.on('loading_screen', (p,m)=>console.log('Cargando:', p+'%', m));
+client.on('authenticated', ()=>console.log('Autenticado ✅'));
+client.on('auth_failure', e=>console.error('Fallo de autenticación ❌:', e));
+client.on('disconnected', r=>console.log('Desconectado 🔌:', r));
+client.on('ready', ()=>console.log('READY'));
+
+// --- Conversación ---
+const SESS = new Map(); // chatId -> { i, data }
+// Mapa para almacenar el último ID de mensaje procesado por chat.
+// Esto evita ejecutar la misma lógica múltiples veces si WhatsApp reenvía o duplica mensajes.
+const LAST_MSG_ID = new Map();
+
+client.on('message', async (msg) => {
+  const chatId = msg.from;
+  const text = (msg.body || '').trim();
+  console.log('> Mensaje:', chatId, JSON.stringify(text));
+
+  // --- Antirebote por ID de mensaje (más robusto) ---
+  try {
+    // Construye una clave única para cada mensaje usando _serialized si existe,
+    // o combinando remitente, timestamp y un fragmento del cuerpo del mensaje.
+    const msgKey =
+      (msg.id && (msg.id._serialized || msg.id.id)) ||
+      `${chatId}-${msg.timestamp || Date.now()}-${(text || '').slice(0, 32)}`;
+    const lastKey = LAST_MSG_ID.get(chatId);
+    if (lastKey && lastKey === msgKey) {
+      // Mensaje duplicado detectado; no procesar de nuevo
+      return;
+    }
+    LAST_MSG_ID.set(chatId, msgKey);
+  } catch (e) {
+    console.warn('Antirebote error (ignorado):', e.message || e);
+    // Si falla algo con el antirebote, continuar sin bloquear la conversación
+  }
+
+  // --- Comandos globales (menú/inicio/ayuda) ---
+  try {
+    // Normalizar texto (eliminando tildes) y pasar a minúsculas
+    const normGlobal = text
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim()
+      .toLowerCase();
+    // Si el usuario escribe "menu", "inicio" o "ayuda" en cualquier momento,
+    // reiniciamos la sesión y mostramos el menú principal.
+    if (/^(menu|inicio|ayuda)$/.test(normGlobal)) {
+      // Crear un nuevo estado base para este chat
+      SESS.set(chatId, { i: 0, data: baseData() });
+      DRAFTS.delete(chatId);
+      // Presentar el menú principal
+      const menuMsg = renderMainMenu();
+      try {
+        await msg.reply(menuMsg);
+      } catch {
+        await client.sendMessage(chatId, menuMsg);
+      }
+      return;
+    }
+  } catch (e) {
+    console.error('Error procesando comando global:', e);
+  }
+
+// --- Trigger universal para "PAGARÉ"/"PAGARE" (ignora mayúsculas y acentos) ---
+try {
+  const normalized = text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase();
+  if (/PAGARE/.test(normalized)) {
+    // Ajustamos la bienvenida para iniciar solicitando el tipo de documento
+    const bienvenida = 'Bienvenido 👋.\n¿Qué deseas generar?\n1. Contrato\n2. Pagarés\n3. Ambos\n\nEnvía solo el número correspondiente:';
+    await msg.reply(bienvenida);
+    // Si el mensaje es exactamente "PAGARE", iniciamos el flujo aquí y evitamos duplicar el prompt
+    if (/^PAGARE$/.test(normalized)) {
+      SESS.set(chatId, { i:0, data: baseData() });
+      return; // evita que el bloque de inicio vuelva a preguntar
+    }
+  }
+} catch (e) {
+  console.error('Error en trigger PAGARE:', e);
+}
+
+  // --- RECEPCIÓN DE EVIDENCIAS (FOTO CON QR) ---
+  if (msg.hasMedia) {
+    try {
+      const media = await msg.downloadMedia();
+      if (!media || !media.data) throw new Error('No pude descargar la imagen.');
+      const buf = Buffer.from(media.data, 'base64');
+
+      const qrRaw = await decodeQRFromBuffer(buf).catch(()=>'');
+      const qrObj = parseQRText(qrRaw);
+
+      // Intentar leer folio del texto ("FIRMADO 03" / "PAGADO 3")
+      const folioFromText = (text.match(/(?:FIRMADO|PAGADO)\s*(\d{1,2})/i) || [])[1];
+      const accion = /PAGADO/i.test(text) ? 'pagado' : (/FIRMADO/i.test(text) ? 'firmado' : null);
+
+      // Determinar folio final
+      let folio = null;
+      if (folioFromText) folio = two(Number(folioFromText));
+      else if (qrObj.FOLIO) folio = two(Number(qrObj.FOLIO));
+
+      if (!qrObj.CLIENTE) {
+        await msg.reply('⚠️ No pude leer CLIENTE del QR. Envíe "FIRMADO 01" o "PAGADO 01" junto con la foto, o asegúrese de que el QR sea legible.');
+        return;
+      }
+
+      const found = findMetaByQR(qrObj);
+      if (!found) {
+        await msg.reply(`⚠️ No encontré registro local para el cliente **${qrObj.CLIENTE}**. Verifique que ya se generó la tanda y exista su meta.json.`);
+        return;
+      }
+      const { meta, baseDir } = found;
+
+      if (!folio) {
+        await msg.reply('🔎 Foto recibida. Detecté el cliente por QR, pero no el **folio**. Responda con "FIRMADO 01" o "PAGADO 01" para clasificarla.');
+        // Guarda en inbox por si acaso
+        const inboxDir = path.join(baseDir, 'inbox');
+        fs.mkdirSync(inboxDir, { recursive: true });
+        const tmp = path.join(inboxDir, `evidencia_${Date.now()}.${media.mimetype?.includes('png')?'png':'jpg'}`);
+        fs.writeFileSync(tmp, buf);
+        return;
+      }
+
+      // Verificar que el folio exista en meta
+      const existe = meta.pagares?.some(p => p.folio === folio);
+      if (!existe) {
+        await msg.reply(`⚠️ El folio **${folio}** no existe en esta venta. Revise el número o genere nuevamente el QR.`);
+        return;
+      }
+
+      // Si no especificó accion, preguntamos
+      let finalAccion = accion;
+      if (!finalAccion) {
+        await msg.reply(`✅ Foto reconocida: CLIENTE=${meta.cliente_slug} FOLIO=${folio}.\nResponda con "FIRMADO ${Number(folio)}" o "PAGADO ${Number(folio)}" para clasificarla.`);
+        // Guarda en tmp
+        const tmpDir = path.join(baseDir, `folio_${folio}`, 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const tmp = path.join(tmpDir, `evid_${Date.now()}.${media.mimetype?.includes('png')?'png':'jpg'}`);
+        fs.writeFileSync(tmp, buf);
+        return;
+      }
+
+      // Guardar en firmado/pagado
+      const destDir = path.join(baseDir, `folio_${folio}`, finalAccion);
+      fs.mkdirSync(destDir, { recursive: true });
+      const dest = path.join(destDir, `evid_${Date.now()}.${media.mimetype?.includes('png')?'png':'jpg'}`);
+      fs.writeFileSync(dest, buf);
+
+      await msg.reply(`📦 Evidencia guardada en:\n${dest}`);
+      return;
+    } catch (e) {
+      console.error('Error procesando media:', e);
+      await msg.reply('⚠️ No pude procesar la imagen/QR. Asegúrese de que el QR esté nítido y se vea en la foto.');
+      return;
+    }
+  }
+
+  // comandos globales
+  if (/^CANCELAR$/i.test(text)) { SESS.delete(chatId); DRAFTS.delete(chatId); return msg.reply('🛑 Borrador cancelado y proceso terminado.'); }
+  if (/^STATUS$/i.test(text))   { return msg.reply(SESS.has(chatId) ? `Paso ${SESS.get(chatId).i+1}/${STEPS.length}` : 'Sin flujo activo. Envíe *PAGARE*'); }
+
+  // --- PREVIEW DE CONTRATO POR WHATSAPP ---
+  // Permite generar un contrato de prueba con datos de ejemplo sin tener que llenar todo el cuestionario.
+  // Comandos aceptados: PREVIEW, CONTRATO PREVIEW, PREVIEW CONTRATO
+  if (/^(CONTRATO\s*PREVIEW|PREVIEW\s*CONTRATO|PREVIEW)$/i.test(text)) {
+    try {
+      // Cargamos un ejemplo de datos desde config/sample_input.json. Si no existe, usamos el estado actual o un objeto vacío.
+      let sample = {};
+      try {
+        sample = require('../config/sample_input.json');
+      } catch (_) {
+        // no-op; sample seguirá vacío
+      }
+      // Extraemos data base: usa datos del estado actual si existen, de lo contrario sample.data o sample
+      const currentState = SESS.get(chatId)?.data;
+      const baseDataForContract = (currentState && Object.keys(currentState).length) ? currentState : (sample.data || sample || {});
+      // Datos adicionales del contrato (predio, colindancias, testigos) si vienen en sample.contrato
+      const extraContratoData = sample.contrato || {};
+      // Combinamos data base y datos extra del contrato
+      const combinedData = { ...baseDataForContract, ...extraContratoData };
+      // Si el tipo de documento del estado actual es solo pagarés, no generar contrato preview
+      if (combinedData.tipoDocumento && String(combinedData.tipoDocumento).toLowerCase() === 'pagares') {
+        await msg.reply('Se seleccionó solamente pagarés. No se generará una vista previa del contrato.');
+        return;
+      }
+      
+      // 🔧 CALCULAR listaPagares ANTES de buildMapping
+      if (!combinedData.listaPagares || !Array.isArray(combinedData.listaPagares)) {
+        console.log('🔧 Calculando listaPagares para PREVIEW...');
+        combinedData.listaPagares = calcListaPagares(combinedData);
+        console.log(`✅ listaPagares generado: ${combinedData.listaPagares.length} pagarés`);
+      }
+
+      // Calcular fechaPrimerPago si no existe
+      if (!combinedData.fechaPrimerPago && combinedData.listaPagares.length > 0) {
+        const fp = combinedData.listaPagares[0].fecha_vencimiento.split('-');
+        combinedData.fechaPrimerPago = `${fp[2]}/${fp[1]}/${fp[0]}`;
+      }
+
+      // Construimos el mapeo seguro que normaliza entradas y calcula derivados
+      const contratoOut = buildMapping(combinedData, {
+        numeroALetras,
+        fechaEmision: combinedData.fechaEmision
+      });
+      // Rutas potenciales de la plantilla
+      const candidateTemplates = [
+        path.join(__dirname, '..', 'templates', 'v1', 'contract.docx'),
+        path.join(__dirname, '..', 'templates', 'v1', 'contrato base.docx'),
+        path.join(__dirname, 'modules', 'contracts', 'contrato base.docx'),
+        path.join(__dirname, '..', 'modules', 'contracts', 'contrato base.docx'),
+        path.join(__dirname, 'templates', 'v1', 'contract.docx')
+      ];
+      const templatePathPrev = candidateTemplates.find(p => fs.existsSync(p));
+      if (!templatePathPrev) {
+        await msg.reply('⚠️ No encontré ninguna plantilla DOCX para el contrato. Busqué en:\n' + candidateTemplates.map(p => '• ' + p).join('\n'));
+        return;
+      }
+      const outDirPrev = path.join(__dirname, '..', 'data', 'output', 'contracts');
+      const { outPdf: outPdfPrev } = await generateContractDocxPdf({ data: contratoOut, templatePath: templatePathPrev, outDir: outDirPrev });
+      const contractMediaPrev = MessageMedia.fromFilePath(outPdfPrev);
+      await msg.reply('📄 Contrato (preview) generado. Enviando archivo…');
+      await msg.reply(contractMediaPrev);
+    } catch (e) {
+      console.error('Error en PREVIEW contrato:', e);
+      await msg.reply('⚠️ Error en PREVIEW: ' + (e.message || e));
+    }
+    return;
+  }
+
+  // Handlers de preview/botones si hay un borrador activo
+  if (DRAFTS.has(chatId)) {
+    const draft = DRAFTS.get(chatId);
+
+    if (/^APROBAR$/i.test(text)) {
+      try {
+        // Calcular el saldo al aprobar (total - enganche)
+        draft.data.saldo = Number((draft.data.total - draft.data.enganche).toFixed(2));
+        const tipo = (draft.data.tipoDocumento || 'ambos').toLowerCase();
+        // Si el usuario eligió únicamente pagarés
+        if (tipo === 'pagares') {
+          // Generar sólo el lote de pagarés (y meta.json)
+          const { baseDir, lotePath, meta } = await generarLoteYMeta(draft.data);
+          
+          // 🔧 CALCULAR listaPagares y fechaPrimerPago (aunque no se use el contrato)
+          try {
+            if (!draft.data.listaPagares || !Array.isArray(draft.data.listaPagares)) {
+              console.log('🔧 Calculando listaPagares...');
+              draft.data.listaPagares = calcListaPagares(draft.data);
+              console.log(`✅ listaPagares generado: ${draft.data.listaPagares.length} pagarés`);
+            }
+
+            if (!draft.data.fechaPrimerPago && Array.isArray(draft.data.listaPagares) && draft.data.listaPagares.length > 0) {
+              const fp = draft.data.listaPagares[0].fecha_vencimiento.split('-');
+              draft.data.fechaPrimerPago = `${fp[2]}/${fp[1]}/${fp[0]}`;
+            }
+          } catch (_) {
+            draft.data.listaPagares = [];
+          }
+
+          const media = MessageMedia.fromFilePath(lotePath);
+          await msg.reply('✅ Lote aprobado y generado. Enviando archivo…');
+          await msg.reply(media);
+          await msg.reply([
+            '📂 Archivos guardados:',
+            `• Carpeta: ${baseDir}`,
+            `• Lote: ${lotePath}`,
+            `• Individuales: ${meta.archivos.individuales_dir}`,
+            `• Meta: ${path.join(baseDir, 'meta.json')}`
+          ].join('\n'));
+        } else if (tipo === 'contrato') {
+          // Generar únicamente el contrato (no lotes)
+          try {
+            // 🔧 CALCULAR listaPagares ANTES de buildMapping
+            if (!draft.data.listaPagares || !Array.isArray(draft.data.listaPagares)) {
+              console.log('🔧 Calculando listaPagares...');
+              draft.data.listaPagares = calcListaPagares(draft.data);
+              console.log(`✅ listaPagares generado: ${draft.data.listaPagares.length} pagarés`);
+            }
+
+            // Calcular fechaPrimerPago si no existe
+            if (!draft.data.fechaPrimerPago && Array.isArray(draft.data.listaPagares) && draft.data.listaPagares.length > 0) {
+              const fp = draft.data.listaPagares[0].fecha_vencimiento.split('-');
+              draft.data.fechaPrimerPago = `${fp[2]}/${fp[1]}/${fp[0]}`;
+            }
+
+            // Construye el mapeo seguro para el contrato utilizando los datos del borrador
+            const contratoOut = buildMapping(draft.data, {
+              numeroALetras,
+              fechaEmision: draft.data.fechaEmision
+            });
+            // Elegir plantilla de contrato entre varias rutas posibles
+            const candidateTemplates = [
+              path.join(__dirname, '..', 'templates', 'v1', 'contract.docx'),
+              path.join(__dirname, '..', 'templates', 'v1', 'contrato base.docx'),
+              path.join(__dirname, 'modules', 'contracts', 'contrato base.docx'),
+              path.join(__dirname, '..', 'modules', 'contracts', 'contrato base.docx'),
+              path.join(__dirname, 'templates', 'v1', 'contract.docx')
+            ];
+            const templatePath = candidateTemplates.find(p => fs.existsSync(p));
+            if (!templatePath) {
+              throw new Error('No encontré la plantilla DOCX para el contrato. Probé:\n' + candidateTemplates.map(p => '• ' + p).join('\n'));
+            }
+            const outDir = path.join(__dirname, '..', 'data', 'output', 'contracts');
+            const { outPdf } = await generateContractDocxPdf({ data: contratoOut, templatePath, outDir });
+            const contractMedia = MessageMedia.fromFilePath(outPdf);
+            await msg.reply('📄 Contrato generado. Enviando archivo…');
+            await msg.reply(contractMedia);
+            await msg.reply([
+              '📂 Archivos guardados:',
+              `• Contrato: ${outPdf}`
+            ].join('\n'));
+          } catch (err) {
+            console.error('Error generando contrato:', err);
+            await msg.reply('⚠️ Error generando contrato: ' + (err.message || err));
+          }
+        } else {
+          // Generar ambos: lote y contrato
+          const { baseDir, lotePath, meta } = await generarLoteYMeta(draft.data);
+          const media = MessageMedia.fromFilePath(lotePath);
+          await msg.reply('✅ Lote aprobado y generado. Enviando archivo…');
+          await msg.reply(media);
+          
+          // Generar contrato con los mismos datos
+          try {
+            // 🔧 CALCULAR listaPagares ANTES de buildMapping
+            if (!draft.data.listaPagares || !Array.isArray(draft.data.listaPagares)) {
+              console.log('🔧 Calculando listaPagares...');
+              draft.data.listaPagares = calcListaPagares(draft.data);
+              console.log(`✅ listaPagares generado: ${draft.data.listaPagares.length} pagarés`);
+            }
+
+            // Calcular fechaPrimerPago si no existe
+            if (!draft.data.fechaPrimerPago && Array.isArray(draft.data.listaPagares) && draft.data.listaPagares.length > 0) {
+              const fp = draft.data.listaPagares[0].fecha_vencimiento.split('-');
+              draft.data.fechaPrimerPago = `${fp[2]}/${fp[1]}/${fp[0]}`;
+            }
+
+            const contratoOut = buildMapping(draft.data, {
+              numeroALetras,
+              fechaEmision: draft.data.fechaEmision
+            });
+            const candidateTemplates = [
+              path.join(__dirname, '..', 'templates', 'v1', 'contract.docx'),
+              path.join(__dirname, '..', 'templates', 'v1', 'contrato base.docx'),
+              path.join(__dirname, 'modules', 'contracts', 'contrato base.docx'),
+              path.join(__dirname, '..', 'modules', 'contracts', 'contrato base.docx'),
+              path.join(__dirname, 'templates', 'v1', 'contract.docx')
+            ];
+            const templatePath = candidateTemplates.find(p => fs.existsSync(p));
+            if (!templatePath) {
+              throw new Error('No encontré la plantilla DOCX para el contrato. Probé:\n' + candidateTemplates.map(p => '• ' + p).join('\n'));
+            }
+            const outDir = path.join(__dirname, '..', 'data', 'output', 'contracts');
+            const { outPdf } = await generateContractDocxPdf({ data: contratoOut, templatePath, outDir });
+            const contractMedia = MessageMedia.fromFilePath(outPdf);
+            await msg.reply('📄 Contrato generado. Enviando archivo…');
+            await msg.reply(contractMedia);
+          } catch (err) {
+            console.error('Error generando contrato:', err);
+            await msg.reply('⚠️ Error generando contrato: ' + (err.message || err));
+          }
+          await msg.reply([
+            '📂 Archivos guardados:',
+            `• Carpeta: ${baseDir}`,
+            `• Lote: ${lotePath}`,
+            `• Individuales: ${meta.archivos.individuales_dir}`,
+            `• Meta: ${path.join(baseDir, 'meta.json')}`
+          ].join('\n'));
+        }
+        DRAFTS.delete(chatId);
+        SESS.delete(chatId);
+      } catch (e) {
+        console.error('Error al aprobar/generar:', e);
+        await msg.reply('⚠️ Error al generar los archivos: ' + e.message);
+      }
+      return;
+    }
+
+    if (/^EDITAR$/i.test(text)) {
+      draft.mode = 'editing';
+      DRAFTS.set(chatId, draft);
+      await msg.reply('✏️ Edición activada. Usa: CAMBIAR CAMPO=VALOR. Ejemplo: CAMBIAR MENSUAL=12345.00');
+      return;
+    }
+
+    if (/^CAMBIAR\s+/i.test(text)) {
+      const payload = text.replace(/^CAMBIAR\s+/i, '').trim();
+      const eq = payload.indexOf('=');
+      if (eq === -1) { await msg.reply('Formato inválido. Usa: CAMBIAR CAMPO=VALOR'); return; }
+      const campoRaw = payload.slice(0, eq).trim();
+      const valorRaw = payload.slice(eq + 1).trim();
+
+      const keyNorm = campoRaw.toLowerCase().replace(/\s+/g,'_');
+      const map = {
+        'total': 'total',
+        'enganche': 'enganche',
+        'mensual': 'mensual',
+        'monto': 'mensual',
+        'beneficiario': 'beneficiario',
+        'deudor': 'deudor',
+        'direccion': 'direccion',
+        'poblacion': 'poblacion',
+        'lugar_expedicion': 'lugarExpedicion',
+        'lugar_expedición': 'lugarExpedicion',
+        'lugar_pago': 'lugarPago',
+        'fecha_emision': 'fechaEmision',
+        'fecha_emisión': 'fechaEmision',
+        'moratorios': 'moratorios',
+        'telefono': 'telefono',
+        'teléfono': 'telefono',
+        'regla': 'reglaPref',
+        'regla1530': 'reglaPref',
+        // Anualidades
+        'anualidad': 'anualidadMonto',
+        'anualidad_monto': 'anualidadMonto',
+        'numero_anualidades': 'numeroAnualidades',
+        'anualidades': 'numeroAnualidades',
+        'mes_anualidad': 'anualidadMes',
+        'mes anualidad': 'anualidadMes',
+        // Contrato
+        'genero': 'genero',
+        // Interés anual (cláusula del contrato)
+        'interes': 'interes',
+        'interés': 'interes',
+        // Tipo de documento (contrato/pagarés/ambos)
+        'tipo_documento': 'tipoDocumento',
+        'documento': 'tipoDocumento',
+        'tipo': 'tipoDocumento'
+      };
+      const key = map[keyNorm];
+      if (!key) {
+        await msg.reply('Campo no reconocido. Campos: total, enganche, mensual/monto, beneficiario, deudor, direccion, poblacion, lugar_expedicion, lugar_pago, fecha_emision, moratorios, telefono, regla, anualidad/anualidad_monto, numero_anualidades/anualidades, mes_anualidad, genero, interes/interés, tipo_documento/documento/tipo');
+        return;
+      }
+
+      try {
+        if (['total','enganche','mensual'].includes(key)) {
+          draft.data[key] = parseMoneyLoose(valorRaw);
+        } else if (key === 'moratorios') {
+          draft.data[key] = parsePercentLoose(valorRaw);
+        } else if (key === 'telefono') {
+          draft.data[key] = parseTelefono(valorRaw);
+        } else if (key === 'fechaEmision') {
+          draft.data.fechaEmision = parseDateDMYLoose(valorRaw);
+        } else if (key === 'reglaPref') {
+          const v = valorRaw.trim().toLowerCase();
+          if (!['este mes','mismo','este','mes siguiente','siguiente'].includes(v)) throw Error('Valor inválido para REGLA. Use: "este mes" o "mes siguiente"');
+          draft.data.reglaPref = v.includes('siguiente') ? 'siguiente' : 'mismo';
+        } else if (key === 'anualidadMes') {
+          draft.data[key] = parseMesLoose(valorRaw);
+        } else if (key === 'anualidadMonto') {
+          draft.data[key] = parseMoneyLoose(valorRaw);
+        } else if (key === 'numeroAnualidades') {
+          const n = Number(valorRaw);
+          if (!Number.isInteger(n) || n < 0) throw Error('Número de anualidades inválido.');
+          draft.data[key] = n;
+        } else if (key === 'tipoDocumento') {
+          // Actualizar el tipo de documento (contrato/pagares/ambos)
+          draft.data.tipoDocumento = parseDocType(valorRaw);
+        } else if (key === 'interes') {
+          // Actualizar interés anual
+          draft.data.interes = parsePercentLoose(valorRaw);
+        } else if (key === 'genero') {
+          draft.data.genero = parseGenero(valorRaw);
+        } else {
+          draft.data[key] = String(valorRaw).trim();
+        }
+
+        draft.data.saldo = Number((draft.data.total - draft.data.enganche).toFixed(2));
+
+        // Enviar resumen + botones para continuar el flujo
+        await msg.reply(resumenVenta(draft.data) + '\n\nComandos:\n• EDITAR – activa modo edición\n• CAMBIAR CAMPO=VALOR – aplica cambio (ej. CAMBIAR MENSUAL=12345.00)\n• APROBAR – generar PDFs definitivos\n• CANCELAR – cancelar borrador');
+        const buttons = new Buttons('Revise la información. ¿Cómo procedemos?', [ { body: 'APROBAR' }, { body: 'EDITAR' }, { body: 'CANCELAR' } ], 'PREVIEW', '');
+        await msg.reply(buttons);
+        DRAFTS.set(chatId, { ...draft, mode: 'preview', lastPreviewAt: Date.now() });
+      } catch (e) {
+        console.error('Error al CAMBIAR campo (validación o parseo):', e);
+        await msg.reply('⚠️ No pude aplicar el cambio: ' + e.message);
+      }
+      return;
+    }
+  }
+
+  // iniciar
+  if (/^(PAGARE|NUEVA VENTA)$/i.test(text)) {
+    SESS.set(chatId, { i:0, data: baseData() });
+    return msg.reply(STEPS[0].ask);
+  }
+
+  if (!SESS.has(chatId)) return; // ignorar si no está en flujo
+
+  const st = SESS.get(chatId);
+  const step = STEPS[st.i];
+
+  // Edición al final
+  if (/^EDITAR\s+/i.test(text)) {
+    if (st.i !== STEPS.length - 1) return msg.reply('Solo puede editar al final (después del resumen).');
+    const campo = text.slice(7).trim().toLowerCase();
+    const map = {
+      'total':'total','enganche':'enganche','mensualidad':'mensual',
+      'beneficiario':'beneficiario','deudor':'deudor','direccion':'direccion','poblacion':'poblacion',
+      'lugar expedicion':'lugarExp','lugar pago':'lugarPago','fecha emision':'fechaEmision',
+      'moratorios':'moratorios','telefono':'telefono','regla 15/30':'regla1530',
+      // Anualidades
+      'anualidad':'anualidadMonto','anualidad monto':'anualidadMonto','numero anualidades':'numeroAnualidades','anualidades':'numeroAnualidades','mes anualidad':'anualidadMes',
+      // Contrato
+      'genero':'genero'
+    };
+    const key = map[campo];
+    if (!key) return msg.reply('Campo no reconocido. Intente: total, enganche, mensualidad, beneficiario, deudor, direccion, poblacion, lugar expedicion, lugar pago, fecha emision, moratorios, telefono, regla 15/30, anualidad, numero anualidades, mes anualidad, genero.');
+    const idx = STEPS.findIndex(s => s.key === key);
+    if (idx < 0) return msg.reply('Campo no editable.');
+    st.i = idx;
+    const ask = typeof STEPS[idx].ask === 'function' ? STEPS[idx].ask() : STEPS[idx].ask;
+    return msg.reply(`✏️ Edición de **${campo}**.\n${ask}`);
+  }
+
+  // Confirmar
+  if (/^CONFIRMAR$/i.test(text)) {
+    if (st.i !== STEPS.length - 1) return msg.reply('Aún no llegamos a la confirmación.');
+    try {
+      // Calcula saldo/N antes de generar
+      st.data.saldo = Number((st.data.total - st.data.enganche).toFixed(2));
+      const { baseDir, lotePath, meta } = await generarLoteYMeta(st.data);
+      
+      // 🔧 CALCULAR listaPagares y fechaPrimerPago ANTES de buildMapping
+      if (!st.data.listaPagares || !Array.isArray(st.data.listaPagares)) {
+        console.log('🔧 Calculando listaPagares...');
+        st.data.listaPagares = calcListaPagares(st.data);
+        console.log(`✅ listaPagares generado: ${st.data.listaPagares.length} pagarés`);
+      }
+
+      if (!st.data.fechaPrimerPago && Array.isArray(st.data.listaPagares) && st.data.listaPagares.length > 0) {
+        const fp = st.data.listaPagares[0].fecha_vencimiento.split('-');
+        st.data.fechaPrimerPago = `${fp[2]}/${fp[1]}/${fp[0]}`;
+      }
+
+      // Enviar PDF de lote
+      const media = MessageMedia.fromFilePath(lotePath);
+      await msg.reply('✅ Lote generado. Enviando archivo…');
+      await msg.reply(media);
+      // Generar contrato con los mismos datos
+      try {
+        // Construye el mapeo seguro para el contrato utilizando los datos de la venta
+        const contratoOut = buildMapping(st.data, {
+          numeroALetras,
+          fechaEmision: st.data.fechaEmision
+        });
+        // Elegir plantilla de contrato entre varias rutas posibles
+        const candidateTemplates = [
+          // Ruta recomendada en la raíz del proyecto (../templates/v1/contract.docx)
+          path.join(__dirname, '..', 'templates', 'v1', 'contract.docx'),
+          // Variante con nombre en español
+          path.join(__dirname, '..', 'templates', 'v1', 'contrato base.docx'),
+          // Por si la plantilla vive junto al módulo (src/modules/contracts)
+          path.join(__dirname, 'modules', 'contracts', 'contrato base.docx'),
+          // Igual que la anterior pero un nivel arriba (../modules/contracts)
+          path.join(__dirname, '..', 'modules', 'contracts', 'contrato base.docx'),
+          // Ruta legacy dentro de esta carpeta (src/templates/v1)
+          path.join(__dirname, 'templates', 'v1', 'contract.docx')
+        ];
+        const templatePath = candidateTemplates.find(p => fs.existsSync(p));
+        if (!templatePath) {
+          throw new Error('No encontré la plantilla DOCX para el contrato. Probé:\n' + candidateTemplates.map(p => '• ' + p).join('\n'));
+        }
+        // Salida fuera de src: data/output/contracts
+        const outDir = path.join(__dirname, '..', 'data', 'output', 'contracts');
+        const { outPdf } =
+        await generateContractDocxPdf({ data: contratoOut, templatePath, outDir });
+        const contractMedia = MessageMedia.fromFilePath(outPdf);
+        await msg.reply('📄 Contrato generado. Enviando archivo…');
+        await msg.reply(contractMedia);
+      } catch (err) {
+        console.error('Error generando contrato:', err);
+        await msg.reply('⚠️ Error generando contrato: ' + (err.message || err));
+      }
+
+      // Mensaje con rutas útiles
+      await msg.reply([
+        '📂 Archivos guardados:',
+        `• Carpeta: ${baseDir}`,
+        `• Lote: ${lotePath}`,
+        `• Individuales: ${meta.archivos.individuales_dir}`,
+        `• Meta: ${path.join(baseDir, 'meta.json')}`
+      ].join('\n'));
+
+      SESS.delete(chatId);
+      DRAFTS.delete(chatId);
+    } catch (e) {
+      console.error('Error al generar PDFs/meta:', e);
+      await msg.reply('⚠️ Error al generar los archivos: ' + e.message);
+    }
+    return;
+  }
+
+  // Procesar respuesta del paso actual
+  try {
+    // parsear y guardar
+    await STEPS[st.i].parse(text, st.data);
+
+    // si acabamos de capturar mensualidad, mostrar cálculo rápido y guardar número de pagarés estimado
+    if (step.key === 'mensual') {
+      const N = Math.ceil(toCents(st.data.saldo) / toCents(st.data.mensual));
+      st.data.numeroPagares = N;
+      await msg.reply(`🧮 Saldo: $${st.data.saldo.toLocaleString('es-MX',{minimumFractionDigits:2})}\nMensualidad: $${st.data.mensual.toLocaleString('es-MX',{minimumFractionDigits:2})}\nPagarés estimados: **${N}**`);
+    }
+
+    // avanzar
+    st.i++;
+
+    // si el usuario sólo quiere pagarés, saltar pasos exclusivos del contrato
+    while (st.i < STEPS.length - 1 && st.data && st.data.tipoDocumento === 'pagares' && CONTRATO_KEYS.includes(STEPS[st.i].key)) {
+      st.i++;
+    }
+    // si el usuario indicó que no habrá anualidades, saltar pasos de anualidades
+    while (st.i < STEPS.length - 1 && st.data && st.data._tieneAnualidades === false && ANUAL_KEYS.includes(STEPS[st.i].key)) {
+      st.i++;
+    }
+
+    // si ya llegamos al final…
+    if (st.i >= STEPS.length - 1) {
+      if (step.key !== 'regla1530') {
+        // mostrar resumen + preguntar regla
+        st.i = STEPS.length - 2;
+        await msg.reply(resumenVenta(st.data));
+        const ask1530 = typeof STEPS[st.i].ask === 'function' ? STEPS[st.i].ask() : STEPS[st.i].ask;
+        return msg.reply(ask1530);
+      } else {
+        // venimos de la regla -> mostrar resumen + botones (sin preview)
+        st.i = STEPS.length - 1;
+        try {
+          st.data.saldo = Number((st.data.total - st.data.enganche).toFixed(2));
+          await msg.reply(resumenVenta(st.data) + '\n\nComandos:\n• EDITAR – activa modo edición\n• CAMBIAR CAMPO=VALOR – aplica cambio (ej. CAMBIAR MENSUAL=12345.00)\n• APROBAR – generar PDFs definitivos\n• CANCELAR – cancelar borrador');
+          const buttons = new Buttons('Revise la información. ¿Cómo procedemos?', [ { body: 'APROBAR' }, { body: 'EDITAR' }, { body: 'CANCELAR' } ], 'PREVIEW', '');
+          await msg.reply(buttons);
+          DRAFTS.set(chatId, { data: st.data, mode: 'preview', lastPreviewAt: Date.now() });
+        } catch (e) {
+          console.error('Error generando datos previos a la preview:', e);
+          await msg.reply('⚠️ Error generando datos: ' + e.message);
+        }
+        return;
+      }
+    }
+
+    // preguntar siguiente paso
+    const nextAsk = typeof STEPS[st.i].ask === 'function' ? STEPS[st.i].ask() : STEPS[st.i].ask;
+    return msg.reply(nextAsk);
+
+  } catch (e) {
+    console.error('Error en paso', step.key, e);
+    const ask = typeof step.ask === 'function' ? step.ask() : step.ask;
+    return msg.reply(`⚠️ ${e.message}\n${ask}`);
+  }
+});
+
+client.initialize();
+
+// ---- TEST HOOK para headless (no afecta producción) ----
+try {
+  // Permitimos que el tester invoque el flujo sin levantar WhatsApp.
+  // Intentamos cargar tu router real desde src/flows (las dos variantes).
+  const tryLoadFlows = () => {
+    try { return require('./flows'); } catch (_) {}
+    try { return require('./flows/index.js'); } catch (_) {}
+    return null;
+  };
+
+  const flows = tryLoadFlows();
+
+  // Exportamos una función con firma estándar: (ctx, text, from)
+  module.exports = async function testRouter(ctx, text, from) {
+    if (!flows) {
+      throw new Error('testRouter: no pude cargar src/flows ni src/flows/index.js');
+    }
+
+    // Casos soportados:
+    // 1) export = function(ctx,text,from)
+    if (typeof flows === 'function' && flows.length >= 3) {
+      return flows(ctx, text, from);
+    }
+
+    // 2) export = function(ctx, { body, from })
+    if (typeof flows === 'function' && flows.length <= 2) {
+      return flows(ctx, { body: text, from });
+    }
+
+    // 3) export = { routeFlow(...) }
+    if (typeof flows.routeFlow === 'function') {
+      // Soportar ambas firmas
+      return flows.routeFlow.length >= 3
+        ? flows.routeFlow(ctx, text, from)
+        : flows.routeFlow(ctx, { body: text, from });
+    }
+
+    // 4) export = { handle(...) }
+    if (typeof flows.handle === 'function') {
+      return flows.handle.length >= 3
+        ? flows.handle(ctx, text, from)
+        : flows.handle(ctx, { body: text, from });
+    }
+
+    throw new Error('testRouter: no encontré una firma compatible en src/flows');
+  };
+} catch (e) {
+  // No romper producción si falla el hook
+}

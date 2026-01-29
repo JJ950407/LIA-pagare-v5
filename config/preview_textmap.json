@@ -1,0 +1,31 @@
+{
+  "pageSizeMm": { "w": 215.9, "h": 279.4 },
+  "dpi": 300,
+
+  // Recorta la imagen a la zona del pagaré (ajusta si hace falta)
+  "cropMm": { "x": 8, "y": 8, "w": 200, "h": 105 },
+
+  // Nudge global (si todo está desplazado unos mm)
+  "globalOffsetMm": { "x": 0, "y": 0 },
+
+  "fields": {
+    "NO_PAGARE":         { "x_mm": 142, "y_mm": 14,  "fontPx": 16, "fontWeight": "bold",  "align": "left",  "maxWidth_mm": 30 },
+    "BUENO_POR":         { "x_mm": 178, "y_mm": 14,  "fontPx": 16, "fontWeight": "bold",  "align": "right", "maxWidth_mm": 32 },
+
+    "LUGAR_EXPEDICION":  { "x_mm":  28, "y_mm": 24,  "fontPx": 13, "align": "left",  "maxWidth_mm": 48 },
+    "FECHA_EMISION":     { "x_mm": 106, "y_mm": 24,  "fontPx": 13, "align": "left",  "maxWidth_mm": 48 },
+
+    "BENEFICIARIO":      { "x_mm":  70, "y_mm": 37,  "fontPx": 13, "align": "left",  "maxWidth_mm": 120 },
+    "CANTIDAD_LETRA":    { "x_mm":  28, "y_mm": 49,  "fontPx": 13, "align": "left",  "maxWidth_mm": 160 },
+
+    "LUGAR_PAGO":        { "x_mm":  28, "y_mm": 58,  "fontPx": 13, "align": "left",  "maxWidth_mm": 70  },
+    "FECHA_PAGO":        { "x_mm": 155, "y_mm": 58,  "fontPx": 13, "align": "left",  "maxWidth_mm": 35  },
+
+    "DEUDOR":            { "x_mm":  34, "y_mm": 87,  "fontPx": 13, "align": "left",  "maxWidth_mm": 90  },
+    "DIRECCION":         { "x_mm":  34, "y_mm": 93,  "fontPx": 13, "align": "left",  "maxWidth_mm": 90  },
+    "POBLACION":         { "x_mm":  34, "y_mm": 99,  "fontPx": 13, "align": "left",  "maxWidth_mm": 90  },
+
+    "ACEPTO":            { "x_mm": 155, "y_mm": 87,  "fontPx": 13, "align": "left",  "maxWidth_mm": 50  },
+    "FIRMA":             { "x_mm": 155, "y_mm": 99,  "fontPx": 13, "align": "left",  "maxWidth_mm": 50  }
+  }
+}

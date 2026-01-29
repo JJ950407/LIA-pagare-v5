@@ -1,0 +1,51 @@
+{
+  "name": "lia-pagare-v3",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "preview": "node src/preview.js",
+    "dev": "node src/bot.js",
+    "keep": "caffeinate -dims npm run dev",
+    "deploy": "bash scripts/deploy.sh",
+    "rollback": "bash scripts/rollback.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.78",
+    "canvas": "^2.11.2",
+    "date-fns": "^4.1.0",
+    "dayjs": "^1.11.18",
+    "docxtemplater": "^3.66.7",
+    "dotenv": "^17.2.1",
+    "fs-extra": "^11.3.2",
+    "jimp": "^1.6.0",
+    "libreoffice-convert": "^1.7.0",
+    "minimist": "^1.2.8",
+    "numero-a-letras": "^1.0.6",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^2.4.3",
+    "pdfjs-dist": "^3.11.174",
+    "pizzip": "^3.2.0",
+    "puppeteer": "^24.17.1",
+    "qrcode": "^1.5.4",
+    "qrcode-reader": "^1.0.4",
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.33.5",
+    "whatsapp-web.js": "^1.33.1"
+  },
+  "devDependencies": {
+    "@openai/codex": "^0.27.0"
+  }
+}
+
+{
+  "scripts": {
+    "smoke": "node scripts/smoke.js tests/cases/venta_contrato.json",
+    "smoke:all": "node scripts/smoke.js --all",
+    "test-montos": "node scripts/test-montos.js"
+  }
+}
